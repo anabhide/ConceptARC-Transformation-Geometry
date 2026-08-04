@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments and editor files
+.env
+.venv/
+venv/
+.vscode/
+.idea/
+
+# Dataset and generated artifacts
+data/ConceptARC/
+outputs/*
+!outputs/.gitkeep
+
+# Hugging Face / PyTorch caches (keep outside the repository)
+.cache/
+huggingface/
+torch/
+
+# Cluster logs
+*.out
+*.err
+slurm-*.out
+
+# OS files
+.DS_Store
+Thumbs.db

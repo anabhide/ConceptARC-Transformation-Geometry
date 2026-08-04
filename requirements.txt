@@ -1,0 +1,8 @@
+# Install PyTorch separately first so it matches the CUDA setup on your cluster.
+numpy>=1.26,<3
+pandas>=2.2,<3
+pyarrow>=16,<24
+Pillow>=10,<13
+transformers>=4.44,<6
+tqdm>=4.66,<5
+safetensors>=0.4,<1
