@@ -1,8 +1,15 @@
-"""Extract and cache normalized CLIP or DINOv2 endpoint and direction vectors.
+"""Extract and cache CLIP or DINOv2 endpoint and transformation vectors.
 
-For each ConceptARC pair, this script renders the input and output grids,
-extracts frozen image representations, L2-normalizes both endpoints, computes
-output minus input, and L2-normalizes that transformation direction.
+For every ConceptARC input-output pair, this script:
+1. renders both grids with the baseline renderer;
+2. extracts frozen image features;
+3. L2-normalizes both endpoint features;
+4. computes output minus input;
+5. L2-normalizes the difference when it is non-zero.
+
+An unchanged input-output pair has no mathematically defined unit direction.
+Such rows are preserved with a zero direction vector and direction_valid=False.
+Downstream direction analyses must exclude those rows and report their count.
 """
 
 from __future__ import annotations
@@ -17,21 +24,21 @@ import sys
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import numpy as np
 import pandas as pd
+import PIL
 import torch
 import torch.nn.functional as F
 import transformers
-import PIL
 from PIL import Image
 from tqdm.auto import tqdm
-from transformers import AutoImageProcessor, AutoModel, CLIPVisionModelWithProjection
+from transformers import AutoImageProcessor, AutoModel, CLIPModel
 
 from renderer import BASELINE_CONFIG, parse_grid, render_grid
 
-MODEL_SPECS = {
+MODEL_SPECS: dict[str, dict[str, Any]] = {
     "clip": {
         "checkpoint": "openai/clip-vit-base-patch32",
         "expected_dim": 512,
@@ -46,7 +53,7 @@ MODEL_SPECS = {
 
 
 def set_reproducibility(seed: int) -> None:
-    """Set inference seeds and deterministic backend preferences."""
+    """Set random seeds and deterministic inference preferences."""
     os.environ.setdefault("PYTHONHASHSEED", str(seed))
     random.seed(seed)
     np.random.seed(seed)
@@ -61,6 +68,7 @@ def resolve_device(requested: str) -> torch.device:
     """Resolve 'auto', 'cpu', or an explicit CUDA device."""
     if requested == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     device = torch.device(requested)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
@@ -68,9 +76,10 @@ def resolve_device(requested: str) -> torch.device:
 
 
 def resolve_dtype(name: str, device: torch.device) -> torch.dtype:
-    """Choose a safe inference dtype."""
+    """Resolve the requested inference precision."""
     if name == "auto":
         return torch.float32
+
     mapping = {
         "float32": torch.float32,
         "float16": torch.float16,
@@ -83,37 +92,44 @@ def resolve_dtype(name: str, device: torch.device) -> torch.dtype:
 
 
 def load_model(
-    model_name: str, device: torch.device, dtype: torch.dtype
-) -> tuple[Any, torch.nn.Module, Callable[[Any], torch.Tensor]]:
-    """Load one frozen encoder and return its processor and feature function."""
+    model_name: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[Any, torch.nn.Module, Callable[[torch.Tensor], torch.Tensor]]:
+    """Load one frozen encoder and return its processor and image encoder.
+
+    CLIP is loaded as the full official CLIPModel and queried only through
+    get_image_features(). This avoids the noisy text-weight mismatch report
+    produced by some Transformers versions when a full CLIP checkpoint is
+    loaded directly into a vision-only class.
+    """
     spec = MODEL_SPECS[model_name]
     checkpoint = spec["checkpoint"]
     processor = AutoImageProcessor.from_pretrained(checkpoint)
 
     if model_name == "clip":
-        model = CLIPVisionModelWithProjection.from_pretrained(
-            checkpoint, torch_dtype=dtype
-        )
+        model = CLIPModel.from_pretrained(checkpoint)
 
-        def feature_fn(outputs: Any) -> torch.Tensor:
-            return outputs.image_embeds
+        def encode(pixel_values: torch.Tensor) -> torch.Tensor:
+            return model.get_image_features(pixel_values=pixel_values)
 
     elif model_name == "dinov2":
-        model = AutoModel.from_pretrained(checkpoint, torch_dtype=dtype)
+        model = AutoModel.from_pretrained(checkpoint)
 
-        def feature_fn(outputs: Any) -> torch.Tensor:
+        def encode(pixel_values: torch.Tensor) -> torch.Tensor:
+            outputs = model(pixel_values=pixel_values)
             return outputs.last_hidden_state[:, 0, :]
 
-    else:  # Protected by argparse choices, retained for direct function calls.
+    else:
         raise ValueError(f"Unsupported model: {model_name}")
 
-    model.to(device)
+    model.to(device=device, dtype=dtype)
     model.eval()
     model.requires_grad_(False)
-    return processor, model, feature_fn
+    return processor, model, encode
 
 
-def batched(items: list[Any], batch_size: int):
+def batched(items: list[Any], batch_size: int) -> Iterator[list[Any]]:
     """Yield successive batches from a list."""
     for start in range(0, len(items), batch_size):
         yield items[start : start + batch_size]
@@ -123,17 +139,16 @@ def encode_images(
     images: list[Image.Image],
     *,
     processor: Any,
-    model: torch.nn.Module,
-    feature_fn: Callable[[Any], torch.Tensor],
+    encode_fn: Callable[[torch.Tensor], torch.Tensor],
     device: torch.device,
+    dtype: torch.dtype,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Encode images and return normalized vectors plus pre-normalization norms."""
+    """Encode images and return unit vectors plus their original norms."""
     inputs = processor(images=images, return_tensors="pt")
-    pixel_values = inputs["pixel_values"].to(device=device)
+    pixel_values = inputs["pixel_values"].to(device=device, dtype=dtype)
 
     with torch.inference_mode():
-        outputs = model(pixel_values=pixel_values)
-        raw_features = feature_fn(outputs).float()
+        raw_features = encode_fn(pixel_values).float()
         raw_norms = torch.linalg.vector_norm(raw_features, dim=1)
         if torch.any(raw_norms <= 1e-12):
             raise RuntimeError("Encountered an image feature with near-zero norm")
@@ -152,8 +167,9 @@ def extract_embeddings(
     batch_size: int,
     device: torch.device,
     dtype: torch.dtype,
+    direction_eps: float,
 ) -> pd.DataFrame:
-    """Render all endpoints and compute normalized endpoints and directions."""
+    """Render all pairs and compute normalized endpoints and directions."""
     required = {
         "pair_id",
         "concept",
@@ -172,50 +188,54 @@ def extract_embeddings(
     missing = required - set(manifest.columns)
     if missing:
         raise ValueError(f"Manifest is missing required columns: {sorted(missing)}")
+    if manifest["pair_id"].duplicated().any():
+        raise ValueError("Manifest contains duplicate pair IDs")
+    if direction_eps <= 0:
+        raise ValueError("direction_eps must be positive")
 
-    processor, model, feature_fn = load_model(model_name, device, dtype)
+    processor, model, encode_fn = load_model(model_name, device, dtype)
     records = manifest.to_dict(orient="records")
     output_rows: list[dict[str, Any]] = []
 
+    print(
+        f"Loaded {model_name} checkpoint {MODEL_SPECS[model_name]['checkpoint']} "
+        f"on {device} with {dtype}."
+    )
+
     progress = tqdm(total=len(records), desc=f"Extracting {model_name}")
     for batch_records in batched(records, batch_size):
-        input_images = [
-            render_grid(parse_grid(record["input_grid_json"]), BASELINE_CONFIG)
-            for record in batch_records
-        ]
-        output_images = [
-            render_grid(parse_grid(record["output_grid_json"]), BASELINE_CONFIG)
-            for record in batch_records
-        ]
+        input_grids = [parse_grid(record["input_grid_json"]) for record in batch_records]
+        output_grids = [parse_grid(record["output_grid_json"]) for record in batch_records]
 
-        # Encode inputs and outputs separately so endpoint identity stays explicit.
+        input_images = [render_grid(grid, BASELINE_CONFIG) for grid in input_grids]
+        output_images = [render_grid(grid, BASELINE_CONFIG) for grid in output_grids]
+
         input_features, input_raw_norms = encode_images(
             input_images,
             processor=processor,
-            model=model,
-            feature_fn=feature_fn,
+            encode_fn=encode_fn,
             device=device,
+            dtype=dtype,
         )
         output_features, output_raw_norms = encode_images(
             output_images,
             processor=processor,
-            model=model,
-            feature_fn=feature_fn,
+            encode_fn=encode_fn,
             device=device,
+            dtype=dtype,
         )
 
         differences = output_features - input_features
         difference_norms = np.linalg.norm(differences, axis=1)
-        if np.any(difference_norms <= 1e-12):
-            bad = np.where(difference_norms <= 1e-12)[0].tolist()
-            pair_ids = [batch_records[index]["pair_id"] for index in bad]
-            raise RuntimeError(
-                "Encountered near-zero output-minus-input vector for: "
-                + ", ".join(pair_ids)
-            )
-        directions = differences / difference_norms[:, None]
+        direction_valid = difference_norms > direction_eps
+
+        directions = np.zeros_like(differences, dtype=np.float32)
+        directions[direction_valid] = (
+            differences[direction_valid] / difference_norms[direction_valid, None]
+        ).astype(np.float32, copy=False)
 
         for index, record in enumerate(batch_records):
+            grids_identical = input_grids[index] == output_grids[index]
             output_rows.append(
                 {
                     **record,
@@ -226,11 +246,17 @@ def extract_embeddings(
                     "renderer_id": BASELINE_CONFIG.renderer_id,
                     "input_embedding": input_features[index].tolist(),
                     "output_embedding": output_features[index].tolist(),
-                    "direction_embedding": directions[index]
-                    .astype(np.float32, copy=False)
-                    .tolist(),
+                    "direction_embedding": directions[index].tolist(),
+                    "direction_valid": bool(direction_valid[index]),
+                    "direction_status": (
+                        "valid" if direction_valid[index] else "undefined_zero_difference"
+                    ),
+                    "grids_identical": bool(grids_identical),
                     "input_raw_norm": float(input_raw_norms[index]),
                     "output_raw_norm": float(output_raw_norms[index]),
+                    "endpoint_cosine": float(
+                        np.dot(input_features[index], output_features[index])
+                    ),
                     "endpoint_difference_norm": float(difference_norms[index]),
                 }
             )
@@ -251,12 +277,15 @@ def extract_embeddings(
 
 
 def validate_saved_vectors(frame: pd.DataFrame, tolerance: float = 2e-5) -> None:
-    """Check vector dimensions, finiteness, row identity, and unit norms."""
+    """Validate dimensions, finite values, identities, and vector norms."""
+    if frame.empty:
+        raise ValueError("Embedding table is empty")
     if frame["pair_id"].duplicated().any():
         raise ValueError("Embedding table contains duplicate pair IDs")
 
     expected_rows = len(frame)
-    for column in ("input_embedding", "output_embedding", "direction_embedding"):
+    endpoint_columns = ("input_embedding", "output_embedding")
+    for column in endpoint_columns:
         matrix = np.asarray(frame[column].tolist(), dtype=np.float32)
         if matrix.shape[0] != expected_rows:
             raise ValueError(f"Unexpected row count in {column}")
@@ -269,9 +298,39 @@ def validate_saved_vectors(frame: pd.DataFrame, tolerance: float = 2e-5) -> None
                 f"{column} is not unit-normalized; maximum norm error={max_error:.3g}"
             )
 
+    directions = np.asarray(frame["direction_embedding"].tolist(), dtype=np.float32)
+    if not np.isfinite(directions).all():
+        raise ValueError("Non-finite values found in direction_embedding")
+
+    valid = frame["direction_valid"].to_numpy(dtype=bool)
+    direction_norms = np.linalg.norm(directions, axis=1)
+    if valid.any():
+        max_valid_error = float(np.max(np.abs(direction_norms[valid] - 1.0)))
+        if max_valid_error > tolerance:
+            raise ValueError(
+                "Valid directions are not unit-normalized; "
+                f"maximum norm error={max_valid_error:.3g}"
+            )
+    if (~valid).any():
+        max_invalid_norm = float(np.max(direction_norms[~valid]))
+        if max_invalid_norm > tolerance:
+            raise ValueError(
+                "Invalid directions must be stored as zero vectors; "
+                f"maximum norm={max_invalid_norm:.3g}"
+            )
+
+    inconsistent = frame.loc[
+        frame["grids_identical"] & frame["direction_valid"], "pair_id"
+    ].tolist()
+    if inconsistent:
+        raise ValueError(
+            "Identical grids unexpectedly produced valid directions: "
+            + ", ".join(inconsistent)
+        )
+
 
 def git_commit() -> str | None:
-    """Return the current Git commit when available."""
+    """Return the current repository Git commit when available."""
     try:
         return subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
@@ -290,8 +349,10 @@ def write_run_metadata(
     device: torch.device,
     dtype: torch.dtype,
     seed: int,
+    direction_eps: float,
 ) -> None:
-    """Save the settings and software versions required for the paper write-up."""
+    """Save provenance and software details for the paper write-up."""
+    invalid_rows = frame.loc[~frame["direction_valid"]]
     metadata = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "git_commit": git_commit(),
@@ -308,15 +369,18 @@ def write_run_metadata(
         "feature_type": MODEL_SPECS[model_name]["feature_type"],
         "embedding_dim": int(frame["embedding_dim"].iloc[0]),
         "renderer": asdict(BASELINE_CONFIG),
+        "direction_definition": "normalize(normalize(output)-normalize(input))",
+        "direction_eps": direction_eps,
+        "valid_direction_count": int(frame["direction_valid"].sum()),
+        "invalid_direction_count": int((~frame["direction_valid"]).sum()),
+        "invalid_direction_pair_ids": invalid_rows["pair_id"].tolist(),
         "batch_size": batch_size,
         "seed": seed,
         "device": str(device),
         "dtype": str(dtype),
         "cuda_available": torch.cuda.is_available(),
         "cuda_device_name": (
-            torch.cuda.get_device_name(device)
-            if device.type == "cuda"
-            else None
+            torch.cuda.get_device_name(device) if device.type == "cuda" else None
         ),
         "python_version": sys.version,
         "platform": platform.platform(),
@@ -358,6 +422,12 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="float32 is the recommended paper baseline.",
     )
+    parser.add_argument(
+        "--direction-eps",
+        type=float,
+        default=1e-8,
+        help="Differences at or below this norm are marked as undefined directions.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -379,6 +449,7 @@ def main() -> None:
         batch_size=args.batch_size,
         device=device,
         dtype=dtype,
+        direction_eps=args.direction_eps,
     )
     validate_saved_vectors(frame)
 
@@ -393,12 +464,20 @@ def main() -> None:
         device=device,
         dtype=dtype,
         seed=args.seed,
+        direction_eps=args.direction_eps,
     )
 
+    invalid = frame.loc[~frame["direction_valid"], "pair_id"].tolist()
     print(f"Saved embeddings: {output_path}")
     print(f"Saved run metadata: {output_path.with_suffix('.meta.json')}")
     print(f"Rows: {len(frame)}")
     print(f"Embedding dimension: {frame['embedding_dim'].iloc[0]}")
+    print(f"Valid directions: {int(frame['direction_valid'].sum())}")
+    print(f"Undefined directions: {len(invalid)}")
+    if invalid:
+        print("Undefined direction pair IDs:")
+        for pair_id in invalid:
+            print(f"  - {pair_id}")
 
 
 if __name__ == "__main__":
