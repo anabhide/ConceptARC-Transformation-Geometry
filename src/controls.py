@@ -3,7 +3,8 @@
 Controls included:
 1. static input, output, and input/output-concatenation representations;
 2. explicit visual-change feature decoding;
-3. foldwise ridge residualization of directions on visual-change features;
+3. foldwise ridge residualization of directions on visual-change features
+   as an exploratory analysis not reported in the paper;
 4. repetition of the direction analyses after removing Count.
 
 Rendering robustness is run by extracting named renderer conditions with

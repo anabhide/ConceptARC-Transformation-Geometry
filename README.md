@@ -62,7 +62,9 @@ Install the remaining dependencies:
 python -m pip install -r requirements.txt
 ```
 
-For the exact paper environment, use the versions recorded from the environment used for the final reported runs.
+The experiments were run with Python 3.11. The package versions in
+`requirements.txt` are version-bounded; PyTorch should be installed separately
+using a build compatible with the available hardware and CUDA installation.
 
 ## Dataset
 
@@ -72,19 +74,13 @@ The experiments use the main ConceptARC corpus from the official repository:
 git clone https://github.com/victorvikram/ConceptARC.git data/ConceptARC
 ```
 
-The scripts use only:
+The scripts use:
 
 ```text
 data/ConceptARC/corpus
 ```
 
 and do not use the separate `MinimalTasks` attention-check set.
-
-For exact dataset provenance, record the commit of the downloaded ConceptARC repository:
-
-```bash
-git -C data/ConceptARC rev-parse HEAD
-```
 
 The paper experiments use the corpus containing 16 concepts, 160 tasks, and 907 input--output pairs. `loader.py` validates these counts before continuing.
 
@@ -93,6 +89,8 @@ The paper experiments use the corpus containing 16 concepts, 160 tasks, and 907 
 All commands below should be run from the repository root.
 
 ### 1. Build the ConceptARC manifest
+
+After cloning the repository, run:
 
 ```bash
 python src/loader.py
