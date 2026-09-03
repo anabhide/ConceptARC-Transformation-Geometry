@@ -1,33 +1,38 @@
 # ConceptARC Transformation Geometry
 
-Phase 1 of a research pipeline testing whether ConceptARC input-to-output
-transformations form reusable directions in frozen CLIP and DINOv2 image spaces.
+Code for reproducing the analyses reported in the paper:
 
-## Phase 1 outputs
+> **Representational Structure of ConceptARC Transformations in Pretrained Vision Models**
 
-The pipeline creates:
+The code evaluates whether human-defined ConceptARC transformation families are reflected in reusable directions between input and output representations of frozen pretrained vision models.
 
-- `outputs/manifest.parquet`: validated pair-level ConceptARC data and metadata.
-- `outputs/render_inspection.png`: deterministic rendering sanity-check sheet.
-- `outputs/render_inspection.renderer.json`: exact renderer settings.
-- `outputs/clip_embeddings.parquet`: normalized CLIP input, output, and direction vectors.
-- `outputs/clip_embeddings.meta.json`: checkpoint, environment, renderer, and run metadata.
-- `outputs/dinov2_embeddings.parquet`: normalized DINOv2 input, output, and direction vectors.
-- `outputs/dinov2_embeddings.meta.json`: checkpoint, environment, renderer, and run metadata.
+The experiments use the main ConceptARC corpus (160 tasks from 16 concept families; 907 input-output pairs) and evaluate CLIP and DINOv2 using:
 
-Generated data and model artifacts are intentionally excluded from Git.
+* input-to-output transformation directions;
+* task-level organization by ConceptARC family;
+* leave-one-task-out (LOTO) concept decoding;
+* strict train-to-test decoding;
+* static input, output, and input-output concatenation controls;
+* a 446-dimensional hand-engineered visual-change representation;
+* Count-family ablation;
+* rendering-robustness analyses.
 
-## Repository layout
+
+## Repository structure
 
 ```text
 .
 ├── data/
-│   └── ConceptARC/          # official repository, cloned locally and ignored by Git
-├── outputs/                 # generated artifacts, ignored by Git
+│   └── ConceptARC/          # official ConceptARC repository, cloned locally
+├── outputs/                 # generated artifacts
 ├── src/
-│   ├── loader.py
-│   ├── renderer.py
-│   └── embeddings.py
+│   ├── loader.py            # build and validate the pair-level manifest
+│   ├── renderer.py          # deterministic grid rendering
+│   ├── embeddings.py        # CLIP/DINOv2 embedding extraction
+│   ├── analysis.py          # organization and concept decoding analyses
+│   ├── visual_features.py   # hand-engineered visual-change features
+│   ├── controls.py          # endpoint, visual-feature, and Count controls
+│   └── summarize_results.py # collect analysis results
 ├── .gitignore
 ├── requirements.txt
 └── README.md
@@ -35,7 +40,9 @@ Generated data and model artifacts are intentionally excluded from Git.
 
 ## Environment
 
-Create and activate a Python 3.11 environment:
+The experiments were run with Python 3.11.
+
+Create an environment:
 
 ```bash
 conda create -n conceptarc-geometry python=3.11 -y
@@ -43,8 +50,7 @@ conda activate conceptarc-geometry
 python -m pip install --upgrade pip
 ```
 
-Install a CUDA-compatible PyTorch build using the method recommended for your
-cluster, then verify that CUDA is visible:
+Install a PyTorch build compatible with the available hardware. Verify the installation:
 
 ```bash
 python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.version.cuda)"
@@ -56,53 +62,72 @@ Install the remaining dependencies:
 python -m pip install -r requirements.txt
 ```
 
-Record the fully resolved environment after a successful run:
+For the exact paper environment, use the versions recorded from the environment used for the final reported runs.
 
-```bash
-python -m pip freeze > environment.lock.txt
-```
+## Dataset
 
-## Obtain ConceptARC
-
-Clone the official dataset repository without adding it to this Git repository:
+The experiments use the main ConceptARC corpus from the official repository:
 
 ```bash
 git clone https://github.com/victorvikram/ConceptARC.git data/ConceptARC
 ```
 
-The scripts use only `data/ConceptARC/corpus`. They do not load the separate
-`MinimalTasks` attention-check set.
+The scripts use only:
 
-For stronger provenance, record the exact dataset commit:
+```text
+data/ConceptARC/corpus
+```
+
+and do not use the separate `MinimalTasks` attention-check set.
+
+For exact dataset provenance, record the commit of the downloaded ConceptARC repository:
 
 ```bash
 git -C data/ConceptARC rev-parse HEAD
 ```
 
-## Run Phase 1
+The paper experiments use the corpus containing 16 concepts, 160 tasks, and 907 input--output pairs. `loader.py` validates these counts before continuing.
 
-All commands assume they are run from the repository root.
+## Reproducing the paper analyses
 
-### 1. Build and validate the pair-level manifest
+All commands below should be run from the repository root.
+
+### 1. Build the ConceptARC manifest
 
 ```bash
 python src/loader.py
 ```
 
-The command fails if the data do not contain 16 concepts, 160 main tasks, ten
-tasks per concept, and 907 total train/test transformations.
+This creates:
 
-### 2. Inspect the baseline renderer
+```text
+outputs/manifest.parquet
+outputs/manifest.meta.json
+```
+
+The manifest contains the validated grids, task/concept identifiers, train/test split, and dataset checksums.
+
+### 2. Inspect the renderer
+
+Run:
 
 ```bash
 python src/renderer.py --sample-size 12 --seed 42
 ```
 
-Open `outputs/render_inspection.png` and manually check that grids are centered,
-colors are correct, cell boundaries are visible, and input/output identities are
-not reversed.
+This creates a rendering inspection sheet under `outputs/`.
 
-### 3. Extract CLIP embeddings on a GPU
+The baseline renderer uses:
+
+* 224 $\times$ 224 RGB images;
+* the ARC color palette;
+* 14-pixel outer padding;
+* a near-white canvas;
+* one-pixel grid lines.
+
+The same deterministic renderer is applied to input and output grids.
+
+### 3. Extract baseline CLIP embeddings
 
 ```bash
 python src/embeddings.py \
@@ -113,7 +138,14 @@ python src/embeddings.py \
   --seed 42
 ```
 
-### 4. Extract DINOv2 embeddings on a GPU
+This creates:
+
+```text
+outputs/clip_embeddings.parquet
+outputs/clip_embeddings.meta.json
+```
+
+### 4. Extract baseline DINOv2 embeddings
 
 ```bash
 python src/embeddings.py \
@@ -124,22 +156,263 @@ python src/embeddings.py \
   --seed 42
 ```
 
-Reduce `--batch-size` if GPU memory is insufficient. Keep `float32` for the
-baseline paper run; lower precision can be examined separately if needed.
+This creates:
 
-## What each embedding row contains
+```text
+outputs/dinov2_embeddings.parquet
+outputs/dinov2_embeddings.meta.json
+```
 
-Each row preserves:
+The models are loaded from:
 
-- pair, concept, task, split, and within-split pair identity;
-- source task path and SHA-256 checksum;
-- input and output dimensions and exact grids;
-- checkpoint, feature type, embedding dimension, and renderer identifier;
-- normalized input embedding;
-- normalized output embedding;
-- normalized `output - input` direction;
-- pre-normalization endpoint norms and the endpoint-difference norm.
+```text
+openai/clip-vit-base-patch32
+facebook/dinov2-base
+```
 
-This is sufficient for task-level averaging, static endpoint controls,
-leave-one-task-out decoding, strict train-to-test decoding, and direction-based
-analyses without rerunning either vision model.
+and are used without fine-tuning on ConceptARC.
+
+### 5. Run the main organization and decoding analyses
+
+CLIP:
+
+```bash
+python src/analysis.py \
+  --model clip \
+  --permutations 9999 \
+  --bootstraps 10000 \
+  --seed 42
+```
+
+DINOv2:
+
+```bash
+python src/analysis.py \
+  --model dinov2 \
+  --permutations 9999 \
+  --bootstraps 10000 \
+  --seed 42
+```
+
+These analyses produce:
+
+* task-level transformation directions;
+* within- and between-concept cosine similarity;
+* the organization effect;
+* the one-sided permutation test;
+* LOTO predictions and bootstrap confidence intervals;
+* strict train-to-test predictions and bootstrap confidence intervals;
+* per-concept LOTO accuracy.
+
+### 6. Build the hand-engineered visual-change representation
+
+```bash
+python src/visual_features.py
+```
+
+This creates:
+
+```text
+outputs/visual_features.parquet
+```
+
+The representation contains 446 scalar features describing explicit visual properties and relations between the input and output grids.
+
+### 7. Run endpoint, visual-feature, and Count controls
+
+CLIP:
+
+```bash
+python src/controls.py \
+  --model clip \
+  --permutations 9999 \
+  --bootstraps 10000 \
+  --seed 42
+```
+
+DINOv2:
+
+```bash
+python src/controls.py \
+  --model dinov2 \
+  --permutations 9999 \
+  --bootstraps 10000 \
+  --seed 42
+```
+
+These analyses reproduce the static endpoint controls, the rich visual-change control, and the Count ablation reported in the paper.
+
+### 8. Run rendering-robustness analyses
+
+The renderer provides four robustness conditions:
+
+```text
+no_grid
+white_canvas
+padding0
+colorperm42
+```
+
+For each encoder and condition, first extract the embeddings.
+
+For CLIP:
+
+```bash
+python src/embeddings.py \
+  --model clip \
+  --renderer-condition no_grid \
+  --device cuda \
+  --dtype float32 \
+  --batch-size 32 \
+  --seed 42
+```
+
+```bash
+python src/embeddings.py \
+  --model clip \
+  --renderer-condition white_canvas \
+  --device cuda \
+  --dtype float32 \
+  --batch-size 32 \
+  --seed 42
+```
+
+```bash
+python src/embeddings.py \
+  --model clip \
+  --renderer-condition padding0 \
+  --device cuda \
+  --dtype float32 \
+  --batch-size 32 \
+  --seed 42
+```
+
+```bash
+python src/embeddings.py \
+  --model clip \
+  --renderer-condition colorperm42 \
+  --device cuda \
+  --dtype float32 \
+  --batch-size 32 \
+  --seed 42
+```
+
+Run the corresponding analyses:
+
+```bash
+python src/analysis.py \
+  --model clip \
+  --embeddings outputs/rendering/clip_no_grid_embeddings.parquet \
+  --output-dir outputs/rendering_analysis/clip_no_grid \
+  --permutations 9999 \
+  --bootstraps 10000 \
+  --seed 42
+```
+
+```bash
+python src/analysis.py \
+  --model clip \
+  --embeddings outputs/rendering/clip_white_canvas_embeddings.parquet \
+  --output-dir outputs/rendering_analysis/clip_white_canvas \
+  --permutations 9999 \
+  --bootstraps 10000 \
+  --seed 42
+```
+
+```bash
+python src/analysis.py \
+  --model clip \
+  --embeddings outputs/rendering/clip_padding0_embeddings.parquet \
+  --output-dir outputs/rendering_analysis/clip_padding0 \
+  --permutations 9999 \
+  --bootstraps 10000 \
+  --seed 42
+```
+
+```bash
+python src/analysis.py \
+  --model clip \
+  --embeddings outputs/rendering/clip_colorperm42_embeddings.parquet \
+  --output-dir outputs/rendering_analysis/clip_colorperm42 \
+  --permutations 9999 \
+  --bootstraps 10000 \
+  --seed 42
+```
+
+Repeat the same four commands with `--model dinov2` and the corresponding DINOv2 embedding paths.
+
+### 9. Collect the generated result tables
+
+After the baseline, controls, and rendering analyses have been run:
+
+```bash
+python src/summarize_results.py
+```
+
+This collects the generated analysis summaries into CSV files under:
+
+```text
+outputs/final/
+```
+
+## Reproducibility settings
+
+The main reported analyses use:
+
+```text
+Random seed:               42
+Permutation replicates:    9,999
+Bootstrap replicates:     10,000
+CLIP dimension:              512
+DINOv2 dimension:             768
+Valid pair directions:      883
+Total input-output pairs:   907
+Concept families:             16
+Tasks:                       160
+```
+
+Accuracy confidence intervals are obtained by bootstrap resampling at the task level rather than the individual-pair level.
+
+The organization test uses a one-sided permutation test that shuffles concept labels across tasks while preserving the number of tasks assigned to each concept.
+
+## Generated outputs
+
+The main generated files include:
+
+```text
+outputs/manifest.parquet
+outputs/clip_embeddings.parquet
+outputs/dinov2_embeddings.parquet
+outputs/visual_features.parquet
+outputs/phase2/
+outputs/phase3/
+outputs/rendering/
+outputs/rendering_analysis/
+outputs/final/
+```
+
+Generated outputs are intentionally excluded from version control. They can be recreated using the commands above.
+
+## Third-party assets
+
+This repository does not redistribute the ConceptARC dataset or pretrained model weights.
+
+ConceptARC should be obtained from its official repository:
+
+```text
+https://github.com/victorvikram/ConceptARC
+```
+
+The pretrained models are downloaded through their public model repositories:
+
+```text
+openai/clip-vit-base-patch32
+facebook/dinov2-base
+```
+
+Users should follow the licenses and terms associated with these third-party assets.
+
+
+## Reproducibility and hardware
+
+The embedding extraction stage uses pretrained vision models and is intended to run on a GPU. CPU execution is supported by the scripts but may require substantially more time. No generated outputs, model weights, cluster-specific job scripts, or execution logs are included in the repository.
