@@ -56,7 +56,7 @@ BASELINE_CONFIG = RenderConfig()
 
 
 def renderer_conditions() -> dict[str, RenderConfig]:
-    """Return the preregistered matched rendering-robustness conditions."""
+    """Return the predefined matched rendering-robustness conditions."""
     # Keep black/background label 0 fixed and permute the nine nonzero colors.
     rng = random.Random(42)
     nonzero = list(range(1, 10))

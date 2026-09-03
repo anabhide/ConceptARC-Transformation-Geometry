@@ -1,4 +1,4 @@
-"""Collect final ConceptARC results into paper-ready tables and figures."""
+"""Collect ConceptARC analysis summaries into tables and plots."""
 
 from __future__ import annotations
 
