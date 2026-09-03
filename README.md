@@ -389,28 +389,6 @@ outputs/rendering_analysis/
 outputs/final/
 ```
 
-Generated outputs are intentionally excluded from version control. They can be recreated using the commands above.
-
-## Third-party assets
-
-This repository does not redistribute the ConceptARC dataset or pretrained model weights.
-
-ConceptARC should be obtained from its official repository:
-
-```text
-https://github.com/victorvikram/ConceptARC
-```
-
-The pretrained models are downloaded through their public model repositories:
-
-```text
-openai/clip-vit-base-patch32
-facebook/dinov2-base
-```
-
-Users should follow the licenses and terms associated with these third-party assets.
-
-
 ## Reproducibility and hardware
 
 The embedding extraction stage uses pretrained vision models and is intended to run on a GPU. CPU execution is supported by the scripts but may require substantially more time. No generated outputs, model weights, cluster-specific job scripts, or execution logs are included in the repository.
