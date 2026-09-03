@@ -36,7 +36,7 @@ from PIL import Image
 from tqdm.auto import tqdm
 from transformers import AutoImageProcessor, AutoModel, CLIPModel
 
-from renderer import BASELINE_CONFIG, parse_grid, render_grid
+from renderer import get_render_config, parse_grid, render_grid
 
 MODEL_SPECS: dict[str, dict[str, Any]] = {
     "clip": {
@@ -96,12 +96,12 @@ def load_model(
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple[Any, torch.nn.Module, Callable[[torch.Tensor], torch.Tensor]]:
-    """Load one frozen encoder and return its processor and image encoder.
+    """Load one frozen encoder and return a tensor-valued image encoder.
 
-    CLIP is loaded as the full official CLIPModel and queried only through
-    get_image_features(). This avoids the noisy text-weight mismatch report
-    produced by some Transformers versions when a full CLIP checkpoint is
-    loaded directly into a vision-only class.
+    Calling CLIPModel.get_image_features is version-sensitive in recent
+    Transformers releases.  We therefore explicitly run the vision tower and
+    apply CLIP's learned visual projection, which is the documented projected
+    image embedding and always returns a tensor.
     """
     spec = MODEL_SPECS[model_name]
     checkpoint = spec["checkpoint"]
@@ -111,13 +111,19 @@ def load_model(
         model = CLIPModel.from_pretrained(checkpoint)
 
         def encode(pixel_values: torch.Tensor) -> torch.Tensor:
-            return model.get_image_features(pixel_values=pixel_values)
+            vision_output = model.vision_model(
+                pixel_values=pixel_values, return_dict=True
+            )
+            pooled = vision_output.pooler_output
+            if pooled is None:
+                raise RuntimeError("CLIP vision model returned no pooler_output")
+            return model.visual_projection(pooled)
 
     elif model_name == "dinov2":
         model = AutoModel.from_pretrained(checkpoint)
 
         def encode(pixel_values: torch.Tensor) -> torch.Tensor:
-            outputs = model(pixel_values=pixel_values)
+            outputs = model(pixel_values=pixel_values, return_dict=True)
             return outputs.last_hidden_state[:, 0, :]
 
     else:
@@ -168,6 +174,7 @@ def extract_embeddings(
     device: torch.device,
     dtype: torch.dtype,
     direction_eps: float,
+    render_config: Any,
 ) -> pd.DataFrame:
     """Render all pairs and compute normalized endpoints and directions."""
     required = {
@@ -207,8 +214,8 @@ def extract_embeddings(
         input_grids = [parse_grid(record["input_grid_json"]) for record in batch_records]
         output_grids = [parse_grid(record["output_grid_json"]) for record in batch_records]
 
-        input_images = [render_grid(grid, BASELINE_CONFIG) for grid in input_grids]
-        output_images = [render_grid(grid, BASELINE_CONFIG) for grid in output_grids]
+        input_images = [render_grid(grid, render_config) for grid in input_grids]
+        output_images = [render_grid(grid, render_config) for grid in output_grids]
 
         input_features, input_raw_norms = encode_images(
             input_images,
@@ -243,7 +250,7 @@ def extract_embeddings(
                     "model_checkpoint": MODEL_SPECS[model_name]["checkpoint"],
                     "feature_type": MODEL_SPECS[model_name]["feature_type"],
                     "embedding_dim": int(input_features.shape[1]),
-                    "renderer_id": BASELINE_CONFIG.renderer_id,
+                    "renderer_id": render_config.renderer_id,
                     "input_embedding": input_features[index].tolist(),
                     "output_embedding": output_features[index].tolist(),
                     "direction_embedding": directions[index].tolist(),
@@ -350,6 +357,8 @@ def write_run_metadata(
     dtype: torch.dtype,
     seed: int,
     direction_eps: float,
+    render_config: Any,
+    renderer_condition: str,
 ) -> None:
     """Save provenance and software details for the paper write-up."""
     invalid_rows = frame.loc[~frame["direction_valid"]]
@@ -368,7 +377,8 @@ def write_run_metadata(
         "model_checkpoint": MODEL_SPECS[model_name]["checkpoint"],
         "feature_type": MODEL_SPECS[model_name]["feature_type"],
         "embedding_dim": int(frame["embedding_dim"].iloc[0]),
-        "renderer": asdict(BASELINE_CONFIG),
+        "renderer_condition": renderer_condition,
+        "renderer": asdict(render_config),
         "direction_definition": "normalize(normalize(output)-normalize(input))",
         "direction_eps": direction_eps,
         "valid_direction_count": int(frame["direction_valid"].sum()),
@@ -404,12 +414,6 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("outputs/manifest.parquet"),
     )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=None,
-        help="Defaults to outputs/<model>_embeddings.parquet.",
-    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument(
         "--device",
@@ -429,6 +433,17 @@ def parse_args() -> argparse.Namespace:
         help="Differences at or below this norm are marked as undefined directions.",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--renderer-condition",
+        choices=["baseline", "no_grid", "white_canvas", "padding0", "colorperm42"],
+        default="baseline",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Default: outputs/<model>_embeddings.parquet for baseline, or outputs/rendering/<model>_<condition>_embeddings.parquet.",
+    )
     return parser.parse_args()
 
 
@@ -437,7 +452,15 @@ def main() -> None:
     if args.batch_size <= 0:
         raise ValueError("batch-size must be positive")
 
-    output_path = args.output or Path(f"outputs/{args.model}_embeddings.parquet")
+    render_config = get_render_config(args.renderer_condition)
+    if args.output is not None:
+        output_path = args.output
+    elif args.renderer_condition == "baseline":
+        output_path = Path(f"outputs/{args.model}_embeddings.parquet")
+    else:
+        output_path = Path(
+            f"outputs/rendering/{args.model}_{args.renderer_condition}_embeddings.parquet"
+        )
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype, device)
     set_reproducibility(args.seed)
@@ -450,6 +473,7 @@ def main() -> None:
         device=device,
         dtype=dtype,
         direction_eps=args.direction_eps,
+        render_config=render_config,
     )
     validate_saved_vectors(frame)
 
@@ -465,6 +489,8 @@ def main() -> None:
         dtype=dtype,
         seed=args.seed,
         direction_eps=args.direction_eps,
+        render_config=render_config,
+        renderer_condition=args.renderer_condition,
     )
 
     invalid = frame.loc[~frame["direction_valid"], "pair_id"].tolist()
