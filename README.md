@@ -130,7 +130,7 @@ The same deterministic renderer is applied to input and output grids.
 ```bash
 python src/embeddings.py \
   --model clip \
-  --device cuda \
+  --device cpu \
   --dtype float32 \
   --batch-size 32 \
   --seed 42
@@ -148,7 +148,7 @@ outputs/clip_embeddings.meta.json
 ```bash
 python src/embeddings.py \
   --model dinov2 \
-  --device cuda \
+  --device cpu \
   --dtype float32 \
   --batch-size 32 \
   --seed 42
@@ -259,7 +259,7 @@ For CLIP:
 python src/embeddings.py \
   --model clip \
   --renderer-condition no_grid \
-  --device cuda \
+  --device cpu \
   --dtype float32 \
   --batch-size 32 \
   --seed 42
@@ -269,7 +269,7 @@ python src/embeddings.py \
 python src/embeddings.py \
   --model clip \
   --renderer-condition white_canvas \
-  --device cuda \
+  --device cpu \
   --dtype float32 \
   --batch-size 32 \
   --seed 42
@@ -279,7 +279,7 @@ python src/embeddings.py \
 python src/embeddings.py \
   --model clip \
   --renderer-condition padding0 \
-  --device cuda \
+  --device cpu \
   --dtype float32 \
   --batch-size 32 \
   --seed 42
@@ -289,7 +289,7 @@ python src/embeddings.py \
 python src/embeddings.py \
   --model clip \
   --renderer-condition colorperm42 \
-  --device cuda \
+  --device cpu \
   --dtype float32 \
   --batch-size 32 \
   --seed 42
@@ -389,6 +389,4 @@ outputs/rendering_analysis/
 outputs/final/
 ```
 
-## Reproducibility and hardware
-
-The embedding extraction stage uses pretrained vision models and is intended to run on a GPU. CPU execution is supported by the scripts but may require substantially more time. No generated outputs, model weights, cluster-specific job scripts, or execution logs are included in the repository.
+The reported experiments were run on CPU nodes. The embedding extraction script also supports CUDA when a compatible GPU is available.
